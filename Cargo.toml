@@ -1,0 +1,10 @@
+[package]
+name = "qprofrs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.30", features = ["derive"] }
+color-eyre = "0.6.3"
+qapi = { version = "0.15.0", features = ["qmp"] }
+regex = "1.11.1"
