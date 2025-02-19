@@ -14,6 +14,12 @@ use {
     tokio::{io::WriteHalf, net::UnixStream, signal::ctrl_c},
 };
 
+const RECURSIVE_FUNCTION_PATTERNS: &[&[&str]] = &[&[
+    "kernel::dbt::translate::translate_with_stack",
+    "kernel::dbt::translate::FunctionTranslator::translate_block",
+    "kernel::dbt::translate::FunctionTranslator::translate_statement",
+]];
+
 #[derive(Debug)]
 struct StackFrame {
     rbp: u64,
@@ -65,34 +71,17 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         // should never terminate
-        _ = run_loop( &qmp, args.frequency,  &mut stacks) => {
+        _ = run_loop(&qmp, args.frequency,  &mut stacks) => {
             Ok(())
         },
         // print map and terminate on exit
         _ = ctrl_c() => {
             eprintln!("exiting!");
+          //  pause_guest(&qmp).await?;// not necessary, but convenient
             print_stacks(&stacks, &debug, args.offset)?;
             Ok(())
         },
     }
-}
-
-async fn get_stack_frame(
-    qmp: &QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>,
-    guest_ptr: u64,
-) -> Result<StackFrame> {
-    let dump = qmp
-        .execute(&qmp::human_monitor_command {
-            cpu_index: None,
-            command_line: format!("x /2g {guest_ptr:#x}"),
-        })
-        .await?;
-    let rbp = u64::from_str_radix(str::from_utf8(&dump.as_bytes()[0x14..0x24])?, 16)?;
-    let rip = u64::from_str_radix(str::from_utf8(&dump.as_bytes()[0x27..0x37])?, 16)?;
-
-    let frame = StackFrame { rbp, rip };
-
-    Ok(frame)
 }
 
 async fn run_loop(
@@ -112,11 +101,7 @@ async fn run_loop(
 
         let start = Instant::now();
 
-        qmp.execute(&qmp::human_monitor_command {
-            cpu_index: None,
-            command_line: "stop".into(),
-        })
-        .await?;
+        pause_guest(qmp).await?;
 
         // get all register values
         let registers = qmp
@@ -138,6 +123,7 @@ async fn run_loop(
         let mut stack = vec![];
         let mut current_bp = rbp;
 
+        // iterate over stack frames
         while current_bp != 0 {
             let frame = get_stack_frame(qmp, current_bp).await?;
             stack.push(frame.rip);
@@ -148,11 +134,7 @@ async fn run_loop(
 
         stacks.push(stack);
 
-        qmp.execute(&qmp::human_monitor_command {
-            cpu_index: None,
-            command_line: "cont".into(),
-        })
-        .await?;
+        resume_guest(qmp).await?;
 
         let end = Instant::now();
 
@@ -160,11 +142,29 @@ async fn run_loop(
     }
 }
 
+async fn get_stack_frame(
+    qmp: &QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>,
+    guest_ptr: u64,
+) -> Result<StackFrame> {
+    let dump = qmp
+        .execute(&qmp::human_monitor_command {
+            cpu_index: None,
+            command_line: format!("x /2g {guest_ptr:#x}"),
+        })
+        .await?;
+    let rbp = u64::from_str_radix(str::from_utf8(&dump.as_bytes()[0x14..0x24])?, 16)?;
+    let rip = u64::from_str_radix(str::from_utf8(&dump.as_bytes()[0x27..0x37])?, 16)?;
+
+    let frame = StackFrame { rbp, rip };
+
+    Ok(frame)
+}
+
 fn print_stacks(stacks: &Vec<Vec<u64>>, debug: &Loader, offset: u64) -> Result<()> {
     stacks
         .iter()
         .map(|stack| {
-            stack
+            let mut symbols = stack
                 .iter()
                 .rev()
                 .map(|rip| {
@@ -183,11 +183,59 @@ fn print_stacks(stacks: &Vec<Vec<u64>>, debug: &Loader, offset: u64) -> Result<(
                         })
                         .unwrap_or("???".into())
                 })
-                .join(";")
+                .collect::<Vec<_>>()
+                .into_iter();
+
+            let mut filtered_symbols = Vec::new();
+
+            while let Some(symbol) = symbols.next() {
+                if let Some(pattern) = RECURSIVE_FUNCTION_PATTERNS
+                    .iter()
+                    .find(|pattern| pattern[0] == symbol)
+                {
+                    // start of pattern
+
+                    // consume until doesn't match pattern
+                    let mut pattern_index = 1;
+                    while Some(pattern[pattern_index % pattern.len()]) == symbols.next().as_deref()
+                    {
+                        pattern_index += 1;
+                    }
+
+                    // insert one copy of pattern
+                    filtered_symbols.extend(
+                        pattern[..pattern_index & pattern.len()]
+                            .iter()
+                            .map(|s| (*s).to_owned()),
+                    );
+                } else {
+                    filtered_symbols.push(symbol);
+                }
+            }
+
+            filtered_symbols.join(";")
         })
         .counts()
         .into_iter()
         .for_each(|(ident, count)| println!("{ident} {count}"));
 
+    Ok(())
+}
+
+async fn pause_guest(qmp: &QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>) -> Result<()> {
+    qmp.execute(&qmp::human_monitor_command {
+        cpu_index: None,
+        command_line: "stop".into(),
+    })
+    .await?;
+    Ok(())
+}
+
+async fn resume_guest(qmp: &QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>) -> Result<()> {
+    qmp.execute(&qmp::human_monitor_command {
+        cpu_index: None,
+        command_line: "cont".into(),
+    })
+    .await?;
     Ok(())
 }
