@@ -3,17 +3,22 @@ use {
     clap::Parser,
     clap_num::maybe_hex,
     color_eyre::eyre::{eyre, Context, Result},
+    core::str,
+    itertools::Itertools,
     qapi::{
         futures::{QapiService, QmpStreamTokio},
         qmp,
     },
     regex::Regex,
-    std::{
-        collections::HashMap,
-        time::{Duration, Instant},
-    },
+    std::time::{Duration, Instant},
     tokio::{io::WriteHalf, net::UnixStream, signal::ctrl_c},
 };
+
+#[derive(Debug)]
+struct StackFrame {
+    rbp: u64,
+    rip: u64,
+}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -56,36 +61,47 @@ async fn main() -> Result<()> {
         .wrap_err("Failed to negotiate stream")?;
     let (qmp, _handle) = stream.spawn_tokio();
 
-    // function hit counters
-    let mut map = HashMap::<String, u64>::new();
+    let mut stacks = Vec::new();
 
     tokio::select! {
         // should never terminate
-        _ = run_loop(&debug, &qmp, args.frequency, args.offset, &mut map) => {
+        _ = run_loop( &qmp, args.frequency,  &mut stacks) => {
             Ok(())
         },
         // print map and terminate on exit
         _ = ctrl_c() => {
             eprintln!("exiting!");
-
-            for (ident, count) in map {
-                println!("{ident} {count}");
-            }
-
+            print_stacks(&stacks, &debug, args.offset)?;
             Ok(())
         },
     }
 }
 
+async fn get_stack_frame(
+    qmp: &QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>,
+    guest_ptr: u64,
+) -> Result<StackFrame> {
+    let dump = qmp
+        .execute(&qmp::human_monitor_command {
+            cpu_index: None,
+            command_line: format!("x /2g {guest_ptr:#x}"),
+        })
+        .await?;
+    let rbp = u64::from_str_radix(str::from_utf8(&dump.as_bytes()[0x14..0x24])?, 16)?;
+    let rip = u64::from_str_radix(str::from_utf8(&dump.as_bytes()[0x27..0x37])?, 16)?;
+
+    let frame = StackFrame { rbp, rip };
+
+    Ok(frame)
+}
+
 async fn run_loop(
-    debug: &Loader,
     qmp: &QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>,
     frequency: u64,
-    offset: u64,
-    map: &mut HashMap<String, u64>,
+    stacks: &mut Vec<Vec<u64>>,
 ) -> Result<()> {
-    // regex for extracting RIP out of `info registers` command output
-    let re = Regex::new(r"RIP=([0-9a-f]+)").unwrap();
+    // regex for extracting registers out of `info registers` command output
+    let rbp_regex = Regex::new(r"RBP=([0-9a-f]+)").unwrap();
 
     // interval between samples
     let mut interval = tokio::time::interval(Duration::from_nanos(1_000_000_000 / frequency));
@@ -96,6 +112,12 @@ async fn run_loop(
 
         let start = Instant::now();
 
+        qmp.execute(&qmp::human_monitor_command {
+            cpu_index: None,
+            command_line: "stop".into(),
+        })
+        .await?;
+
         // get all register values
         let registers = qmp
             .execute(&qmp::human_monitor_command {
@@ -104,33 +126,67 @@ async fn run_loop(
             })
             .await?;
 
-        // pull out RIP
-        let caps = re
-            .captures(&registers)
-            .ok_or(eyre!("Regex failed to find matches"))?;
+        let rbp = {
+            let caps = rbp_regex
+                .captures(&registers)
+                .ok_or(eyre!("Regex failed to find matches"))?;
 
-        // parse hex
-        let rip = u64::from_str_radix(&caps[1], 16)?;
+            // parse hex
+            u64::from_str_radix(&caps[1], 16)?
+        };
 
-        // get frames
-        let frames = debug.find_frames(rip - offset).unwrap();
+        let mut stack = vec![];
+        let mut current_bp = rbp;
 
-        // build identifier from frames
-        let ident = frames
-            .map(|f| {
-                Ok(f.function
-                    .map(|name| name.demangle().unwrap().into_owned())
-                    .unwrap_or("???".to_owned()))
-            })
-            .collect::<Vec<_>>()
-            .unwrap()
-            .join(";");
+        while current_bp != 0 {
+            let frame = get_stack_frame(qmp, current_bp).await?;
+            stack.push(frame.rip);
+            current_bp = frame.rbp;
+        }
 
-        // insert or increment in map
-        map.entry(ident).and_modify(|e| *e += 1).or_insert(1);
+        let depth = stack.len();
+
+        stacks.push(stack);
+
+        qmp.execute(&qmp::human_monitor_command {
+            cpu_index: None,
+            command_line: "cont".into(),
+        })
+        .await?;
 
         let end = Instant::now();
 
-        eprintln!("RIP: {rip:x}, avg {}us", (end - start).as_micros());
+        eprintln!("depth: {depth}, avg {}us", (end - start).as_micros());
     }
+}
+
+fn print_stacks(stacks: &Vec<Vec<u64>>, debug: &Loader, offset: u64) -> Result<()> {
+    stacks
+        .iter()
+        .map(|stack| {
+            stack
+                .iter()
+                .map(|rip| {
+                    debug
+                        .find_frames(rip - offset)
+                        .expect("failed to find frames")
+                        .last()
+                        .expect("failed to get last element of iterator")
+                        .map(|frame| {
+                            frame
+                                .function
+                                .expect("function field in frame was None")
+                                .demangle()
+                                .expect("failed to demangle")
+                                .into_owned()
+                        })
+                        .unwrap_or("???".into())
+                })
+                .join(";")
+        })
+        .counts()
+        .into_iter()
+        .for_each(|(ident, count)| println!("{ident} {count}"));
+
+    Ok(())
 }

@@ -9,6 +9,7 @@ clap = { version = "4.5.30", features = ["derive"] }
 clap-num = "1.2.0"
 color-eyre = "0.6.3"
 futures-sink = "0.3.31"
+itertools = "0.14.0"
 qapi = { version = "0.15.0", features = ["qmp", "async-tokio-all"] }
 regex = "1.11.1"
 tokio = { version = "1.43.0", features = ["rt", "macros", "time", "signal"] }
