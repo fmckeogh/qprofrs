@@ -166,6 +166,7 @@ fn print_stacks(stacks: &Vec<Vec<u64>>, debug: &Loader, offset: u64) -> Result<(
         .map(|stack| {
             stack
                 .iter()
+                .rev()
                 .map(|rip| {
                     debug
                         .find_frames(rip - offset)
