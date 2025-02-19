@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+addr2line = "0.24.2"
 clap = { version = "4.5.30", features = ["derive"] }
+clap-num = "1.2.0"
 color-eyre = "0.6.3"
-qapi = { version = "0.15.0", features = ["qmp"] }
+futures-sink = "0.3.31"
+qapi = { version = "0.15.0", features = ["qmp", "async-tokio-all"] }
 regex = "1.11.1"
+tokio = { version = "1.43.0", features = ["rt", "macros", "time", "signal"] }
+
+[profile.release]
+debug = true
