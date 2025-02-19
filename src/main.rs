@@ -168,20 +168,33 @@ fn print_stacks(stacks: &Vec<Vec<u64>>, debug: &Loader, offset: u64) -> Result<(
                 .iter()
                 .rev()
                 .map(|rip| {
-                    debug
+                    let frames = debug
                         .find_frames(rip - offset)
-                        .expect("failed to find frames")
-                        .last()
-                        .expect("failed to get last element of iterator")
-                        .map(|frame| {
-                            frame
-                                .function
-                                .expect("function field in frame was None")
-                                .demangle()
-                                .expect("failed to demangle")
-                                .into_owned()
-                        })
-                        .unwrap_or("???".into())
+                        .expect("failed to find frames");
+
+                    let frames = frames.collect::<Vec<_>>().unwrap();
+
+                    match frames.len() {
+                        0 => "???".into(),
+                        1 => frames[0]
+                            .function
+                            .as_ref()
+                            .expect("function field in frame was None")
+                            .demangle()
+                            .expect("failed to demangle")
+                            .into_owned(),
+                        _ => frames
+                            .into_iter()
+                            .rev()
+                            .map(|f| {
+                                f.function
+                                    .expect("function field in frame was None")
+                                    .demangle()
+                                    .expect("failed to demangle")
+                                    .into_owned()
+                            })
+                            .join(";"),
+                    }
                 })
                 .collect::<Vec<_>>()
                 .into_iter();
